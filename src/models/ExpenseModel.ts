@@ -13,7 +13,7 @@ interface ExpenseModelOptions {
   status?: ExpenseStatus;
 }
 export class ExpenseModel {
-  _id?: string;
+  _id: string;
   expenseId: string;
   companyId: string;
   reportId: string;
@@ -23,7 +23,7 @@ export class ExpenseModel {
   status?: ExpenseStatus;
 
   constructor(options: ExpenseModelOptions) {
-    this._id = undefined;
+    this._id = options.expenseId;
     this.expenseId = options.expenseId;
     this.companyId = options.companyId;
     this.reportId = options.reportId;

@@ -57,7 +57,7 @@ export default class ExpenseService {
 
   getExpenseById(expenseId: string): Promise<ExpenseModel | null> {
     return expensesColClient.findOne<ExpenseModel>({
-      expenseId,
+      _id: expenseId,
     });
   }
 
