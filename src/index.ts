@@ -30,8 +30,18 @@ export const expenseService = new ExpenseService();
 (async () => {
   await Promise.all([redisClient.connect(), mongoClient.connect()]);
   expensesColClient.createIndex({
+    expenseId: 1,
+  });
+  expensesColClient.createIndex({
     companyId: 1,
     reportId: 1,
+  });
+  reportsColClient.createIndex({
+    companyId: 1,
+    reportId: 1,
+  });
+  summariesColClient.createIndex({
+    summaryId: 1,
   });
   app(config.get<number>("server.port"));
 })();
