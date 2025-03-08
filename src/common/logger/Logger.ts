@@ -1,5 +1,5 @@
 export default class Logger {
-  log(data: any) {
-    console.log(data);
+  log(...values: any) {
+    console.log(...values);
   }
 }
