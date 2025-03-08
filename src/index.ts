@@ -3,7 +3,7 @@ import config from "config";
 import { MongoClient } from "mongodb";
 import app from "./app";
 import Logger from "./common/logger/Logger";
-import ExpenseService from "./services/ExpenseService";
+import ExpenseService from "./services/ExpenseService/ExpenseService";
 import { ReportModel } from "./models/ReportModel";
 import { ExpenseModel } from "./models/ExpenseModel";
 import { UploadSummaryModel } from "./models/UploadSummaryModel";

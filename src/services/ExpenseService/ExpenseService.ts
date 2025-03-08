@@ -8,18 +8,24 @@ import {
   redisClient,
   reportsColClient,
   summariesColClient,
-} from "..";
-import * as s3Utils from "../common/s3/utils";
+} from "../..";
+import * as s3Utils from "../../common/s3/utils";
 import {
   ExpenseModel,
   ExpenseStatus,
   minifyExpense,
-} from "../models/ExpenseModel";
-import { batch } from "../common/stream/utils";
+} from "../../models/ExpenseModel";
+import { batch } from "../../common/stream/utils";
 import Queue from "bull";
-import { UploadSummaryModel } from "../models/UploadSummaryModel";
-import { companiesToExclude } from "../common/constants";
-import { ReportModel, reportsFromExpenses } from "../models/ReportModel";
+import { UploadSummaryModel } from "../../models/UploadSummaryModel";
+import { companiesToExclude } from "../../common/constants";
+import { ReportModel, reportsFromExpenses } from "../../models/ReportModel";
+import {
+  getRedisReportKey,
+  getRedisSummaryKey,
+  getRedisSummaryReportsKey,
+  getReportKey,
+} from "./utils";
 
 interface UploadExpenseJob {
   summaryId: string;
@@ -75,13 +81,19 @@ export default class ExpenseService {
     companyId: string,
     reportId: string
   ): Promise<ReportModel | null> {
-    let report = (await reportsColClient.findOne({
-      companyId,
-      reportId,
-    })) as ReportModel;
+    let report: ReportModel | null = (await redisClient.json.get(
+      getRedisReportKey({ companyId, reportId })
+    )) as ReportModel | null;
+
     if (report) return report;
 
-    // fallback to Expenses collection if report was not generated yet
+    report = await reportsColClient.findOne({
+      companyId,
+      reportId,
+    });
+    if (report) return report;
+
+    // fallback to Expenses collection if report was not generated yet or deleted from redis
     const expensesCursor = await expensesColClient.find<ExpenseModel>({
       companyId,
       reportId,
@@ -145,11 +157,11 @@ export default class ExpenseService {
     summaryId: string
   ): Promise<UploadSummaryModel | null> {
     let summary: UploadSummaryModel | null = (await redisClient.hGetAll(
-      summaryId
+      getRedisSummaryKey(summaryId)
     )) as unknown as UploadSummaryModel;
     if ("_id" in summary) {
       summary.totalReports = (
-        await redisClient.sCard("reports_" + summaryId)
+        await redisClient.sCard(getRedisSummaryReportsKey(summaryId))
       ).toString();
     } else {
       summary = await summariesColClient.findOne({
@@ -171,7 +183,7 @@ export default class ExpenseService {
     callback: () => void
   ) {
     /*
-      Downloading from S3 goes much faster than processing of the data,
+      The downloading from S3 goes much faster than processing of the data,
       so we need to pause stream and wait for tasks to complete
       in order to not run into memory issues
   */
@@ -181,6 +193,7 @@ export default class ExpenseService {
     logger.log(
       `Started uploading expenses from object ${region} ${bucket} ${key}`
     );
+    let tmp = 0;
     stream
       .pipe(
         parse({
@@ -190,11 +203,14 @@ export default class ExpenseService {
       .pipe(batch(1000))
       .on("data", async (expenses) => {
         currProcessing += 1;
+        tmp += 1;
         if (currProcessing >= ExpenseService.maxProcessingPerStream) {
           stream.pause();
         }
         try {
-          await this.handleExpensesUploadChunk(expenses, summaryId);
+          if (tmp < 50) {
+            await this.handleExpensesUploadChunk(expenses, summaryId);
+          }
           if (streamEnded && currProcessing === 1) {
             await this.handleExpensesUploadEnd(summaryId);
             callback();
@@ -225,48 +241,64 @@ export default class ExpenseService {
       (e) => e.status === ExpenseStatus.Completed
     );
 
-    await Promise.all([
-      // Updating reports dynamically on each chunk takes a while... might be due to free  mongo atlas account rate limits
-      // reportsColClient.bulkWrite(
-      //   reports.map((r) => {
-      //     return {
-      //       updateOne: {
-      //         filter: {
-      //           _id: r._id,
-      //         },
-      //         update: {
-      //           $set: {
-      //             reportId: r.reportId,
-      //             companyId: r.companyId,
-      //             companyName: r.companyName,
-      //           },
-      //           $push: {
-      //             expenses: {
-      //               $each: r.expenses,
-      //             },
-      //           },
-      //         },
-      //         upsert: true,
-      //       },
-      //     };
-      //   })
-      // ),
-      expensesColClient.insertMany(expenses),
-    ]);
+    const reports = reportsFromExpenses(completedExpenses);
 
-    // Update real-time data
-    const statuses = this.countStatuses(expenses);
-    const reportKeys = this.getUniqReportKeys(completedExpenses);
-    const redisMulti = redisClient.multi();
-    redisMulti.sAdd("reports_" + summaryId, reportKeys);
-    if (statuses.completed)
-      redisMulti.hIncrBy(summaryId, "totalCompleted", statuses.completed);
-    if (statuses.excluded)
-      redisMulti.hIncrBy(summaryId, "totalExcluded", statuses.excluded);
-    if (statuses.failed)
-      redisMulti.hIncrBy(summaryId, "totalFailed", statuses.failed);
-    redisMulti.hSet(summaryId, "status", "processing");
-    await redisMulti.execAsPipeline();
+    await Promise.all([
+      expensesColClient.insertMany(expenses),
+      (async () => {
+        // Update real-time data
+        const statuses = this.countStatuses(expenses);
+
+        let redisMulti = redisClient.multi();
+        for (const report of reports) {
+          const redisKey = getRedisReportKey(report);
+          redisMulti.exists(redisKey);
+        }
+        const existingReports = await redisMulti.execAsPipeline();
+
+        redisMulti = redisClient.multi();
+        reports.forEach((report, idx) => {
+          const redisKey = getRedisReportKey(report);
+          const exists = existingReports[idx] === 1;
+          /* 
+              TODO: There is a chance that the report may be created right after EXISTS executed by any other process, 
+              so next command (JSON.SET) might replace existing report. It can be fixed with custom redis scripts
+          */
+          if (exists) {
+            redisClient.json.arrAppend(
+              redisKey,
+              "$.expenses",
+              ...(report.expenses as any)
+            );
+          } else {
+            redisMulti.json.set(redisKey, "$", report as any);
+          }
+        });
+
+        const reportKeys = reports.map((r) => getReportKey(r));
+        redisMulti.sAdd(getRedisSummaryReportsKey(summaryId), reportKeys);
+        if (statuses.completed)
+          redisMulti.hIncrBy(
+            getRedisSummaryKey(summaryId),
+            "totalCompleted",
+            statuses.completed
+          );
+        if (statuses.excluded)
+          redisMulti.hIncrBy(
+            getRedisSummaryKey(summaryId),
+            "totalExcluded",
+            statuses.excluded
+          );
+        if (statuses.failed)
+          redisMulti.hIncrBy(
+            getRedisSummaryKey(summaryId),
+            "totalFailed",
+            statuses.failed
+          );
+        redisMulti.hSet(getRedisSummaryKey(summaryId), "status", "processing");
+        await redisMulti.execAsPipeline();
+      })(),
+    ]);
   }
 
   private async handleExpensesUploadEnd(summaryId: string) {
@@ -286,7 +318,9 @@ export default class ExpenseService {
       }
     );
 
-    const reportKeys = await redisClient.sMembers("reports_" + summaryId);
+    const reportKeys = await redisClient.sMembers(
+      getRedisSummaryReportsKey(summaryId)
+    );
     const parsedReportKeys = reportKeys.map((r) => {
       const [companyId, reportId] = r.split("/");
       return {
@@ -299,16 +333,16 @@ export default class ExpenseService {
       this.generateExpenseReports(parsedReportKeys),
       redisClient
         .multi()
-        .hSet(summaryId, "status", "completed")
-        .expire("reports_" + summaryId, 60)
-        .expire(summaryId, 60)
+        .hSet(getRedisSummaryKey(summaryId), "status", "completed")
+        .expire(getRedisSummaryReportsKey(summaryId), 60)
+        .expire(getRedisSummaryKey(summaryId), 60)
         .execAsPipeline(),
     ]);
   }
 
   private async initSummary() {
     const summaryId = uuidv4();
-    await redisClient.hSet(summaryId, {
+    await redisClient.hSet(getRedisSummaryKey(summaryId), {
       _id: summaryId,
       totalCompleted: 0,
       totalExcluded: 0,
@@ -332,14 +366,6 @@ export default class ExpenseService {
       ExpenseStatus,
       number
     >;
-  }
-
-  private getUniqReportKeys(completedExpenses: ExpenseModel[]): string[] {
-    return _.chain(completedExpenses)
-      .groupBy((e) => e.companyId + "/" + e.reportId)
-      .keys()
-      .uniq()
-      .value();
   }
 
   private async getExpenseStatus(
