@@ -257,22 +257,16 @@ export default class ExpenseService {
     // Update real-time data
     const statuses = this.countStatuses(expenses);
     const reportKeys = this.getUniqReportKeys(completedExpenses);
-    const redisOperations = [];
-    redisOperations.push(redisClient.sAdd("reports_" + summaryId, reportKeys));
+    const redisMulti = redisClient.multi();
+    redisMulti.sAdd("reports_" + summaryId, reportKeys);
     if (statuses.completed)
-      redisOperations.push(
-        redisClient.hIncrBy(summaryId, "totalCompleted", statuses.completed)
-      );
+      redisMulti.hIncrBy(summaryId, "totalCompleted", statuses.completed);
     if (statuses.excluded)
-      redisOperations.push(
-        redisClient.hIncrBy(summaryId, "totalExcluded", statuses.excluded)
-      );
+      redisMulti.hIncrBy(summaryId, "totalExcluded", statuses.excluded);
     if (statuses.failed)
-      redisOperations.push(
-        redisClient.hIncrBy(summaryId, "totalFailed", statuses.failed)
-      );
-    redisOperations.push(redisClient.hSet(summaryId, "status", "processing"));
-    await Promise.all(redisOperations);
+      redisMulti.hIncrBy(summaryId, "totalFailed", statuses.failed);
+    redisMulti.hSet(summaryId, "status", "processing");
+    await redisMulti.execAsPipeline();
   }
 
   private async handleExpensesUploadEnd(summaryId: string) {
@@ -303,10 +297,12 @@ export default class ExpenseService {
 
     await Promise.all([
       this.generateExpenseReports(parsedReportKeys),
-
-      redisClient.hSet(summaryId, "status", "completed"),
-      redisClient.expire("reports_" + summaryId, 60),
-      redisClient.expire(summaryId, 60),
+      redisClient
+        .multi()
+        .hSet(summaryId, "status", "completed")
+        .expire("reports_" + summaryId, 60)
+        .expire(summaryId, 60)
+        .execAsPipeline(),
     ]);
   }
 
