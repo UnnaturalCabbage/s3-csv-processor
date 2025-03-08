@@ -4,17 +4,22 @@ import async from "async";
 import _ from "lodash";
 import {
   expensesColClient,
+  logger,
   redisClient,
   reportsColClient,
   summariesColClient,
 } from "..";
 import * as s3Utils from "../common/s3/utils";
-import { ExpenseModel, ExpenseStatus } from "../models/ExpenseModel";
+import {
+  ExpenseModel,
+  ExpenseStatus,
+  minifyExpense,
+} from "../models/ExpenseModel";
 import { batch } from "../common/stream/utils";
 import Queue from "bull";
 import { UploadSummaryModel } from "../models/UploadSummaryModel";
 import { companiesToExclude } from "../common/constants";
-import { ReportModel } from "../models/ReportModel";
+import { ReportModel, reportsFromExpenses } from "../models/ReportModel";
 
 interface UploadExpenseJob {
   summaryId: string;
@@ -49,7 +54,12 @@ export default class ExpenseService {
           job.data.region,
           job.data.bucket,
           job.data.key,
-          done
+          () => {
+            logger.log(
+              `Finished upload expesnes job with id ${job.data.summaryId}`
+            );
+            done();
+          }
         );
       }
     );
@@ -57,7 +67,7 @@ export default class ExpenseService {
 
   getExpenseById(expenseId: string): Promise<ExpenseModel | null> {
     return expensesColClient.findOne<ExpenseModel>({
-      _id: expenseId,
+      expenseId: expenseId,
     });
   }
 
@@ -65,11 +75,11 @@ export default class ExpenseService {
     companyId: string,
     reportId: string
   ): Promise<ReportModel | null> {
-    let report = await reportsColClient.findOne({
+    let report = (await reportsColClient.findOne({
       companyId,
       reportId,
-    });
-    if (report) return new ReportModel(report);
+    })) as ReportModel;
+    if (report) return report;
 
     // fallback to Expenses collection if report was not generated yet
     const expensesCursor = await expensesColClient.find<ExpenseModel>({
@@ -77,19 +87,41 @@ export default class ExpenseService {
       reportId,
     });
     const expenses: ExpenseModel[] = [];
-    let companyName = "";
     for await (const expense of expensesCursor) {
-      companyName = expense.companyName;
       expenses.push(expense);
     }
     if (expenses.length === 0) return null;
-    report = new ReportModel({
-      reportId,
-      companyId,
-      companyName,
-      expenses: expenses,
-    });
+    report = reportsFromExpenses(expenses)[0];
     return report;
+  }
+
+  async generateExpenseReports(
+    data: { companyId: string; reportId: string }[]
+  ): Promise<void> {
+    const expensesCursor = await expensesColClient.find<ExpenseModel>({
+      $or: data,
+    });
+    const reports = new Map<string, ReportModel>();
+    for await (const expense of expensesCursor) {
+      const { companyId, reportId, companyName } = expense;
+      const minifiedExpense = minifyExpense(expense);
+      const reportKey = companyId + reportId;
+      let report = reports.get(reportKey);
+      if (!report) {
+        report = {
+          companyId,
+          reportId,
+          companyName,
+          expenses: [minifiedExpense],
+        };
+        reports.set(reportKey, report);
+      } else {
+        report.expenses.push(minifiedExpense);
+      }
+    }
+    await reportsColClient.insertMany([...reports.values()], {
+      ordered: false,
+    });
   }
 
   async addUploadExpensesJob(url: string): Promise<string | null> {
@@ -99,6 +131,7 @@ export default class ExpenseService {
     const exists = await s3Utils.objectExists(region, bucket, key);
     if (!exists) return null;
     const summaryId = await this.initSummary();
+    logger.log(`Add upload expesnes job with id ${summaryId}`);
     ExpenseService.uploadExpensesQueue.add({
       summaryId,
       region,
@@ -145,6 +178,9 @@ export default class ExpenseService {
     let currProcessing = 0;
     let streamEnded = false;
     const stream = s3Utils.readObject(region, bucket, key);
+    logger.log(
+      `Started uploading expenses from object ${region} ${bucket} ${key}`
+    );
     stream
       .pipe(
         parse({
@@ -153,17 +189,18 @@ export default class ExpenseService {
       )
       .pipe(batch(1000))
       .on("data", async (expenses) => {
-        expenses = ExpenseModel.fromArray(expenses);
         currProcessing += 1;
         if (currProcessing >= ExpenseService.maxProcessingPerStream) {
           stream.pause();
         }
-        await this.handleExpensesUploadChunk(expenses, summaryId);
+        try {
+          await this.handleExpensesUploadChunk(expenses, summaryId);
+          if (streamEnded && currProcessing === 1) {
+            await this.handleExpensesUploadEnd(summaryId);
+            callback();
+          }
+        } catch {}
         currProcessing -= 1;
-        if (streamEnded && currProcessing === 0) {
-          await this.handleExpensesUploadEnd(summaryId);
-          callback();
-        }
         if (currProcessing < ExpenseService.maxProcessingPerStream) {
           stream.resume();
         }
@@ -171,6 +208,7 @@ export default class ExpenseService {
       .on("end", async () => {
         streamEnded = true;
         if (currProcessing === 0) {
+          logger.log(`End`);
           await this.handleExpensesUploadEnd(summaryId);
           callback();
         }
@@ -254,27 +292,22 @@ export default class ExpenseService {
       }
     );
 
-    redisClient.hSet(summaryId, "status", "completed");
-    redisClient.expire("reports_" + summaryId, 60);
-    redisClient.expire(summaryId, 60);
-
-    // workaround for generatins reports
     const reportKeys = await redisClient.sMembers("reports_" + summaryId);
-    const parsedReportKeys = reportKeys.map((r) => r.split("/"));
-    const reports: ReportModel[] = [];
+    const parsedReportKeys = reportKeys.map((r) => {
+      const [companyId, reportId] = r.split("/");
+      return {
+        companyId,
+        reportId,
+      };
+    });
 
-    // TODO: use findyMany/aggregations instead
-    await async.eachLimit(
-      parsedReportKeys,
-      50,
-      async ([companyId, reportId]) => {
-        const report = await this.getExpensesReport(companyId, reportId);
-        if (report) {
-          reports.push(report);
-        }
-      }
-    );
-    reportsColClient.insertMany(reports);
+    await Promise.all([
+      this.generateExpenseReports(parsedReportKeys),
+
+      redisClient.hSet(summaryId, "status", "completed"),
+      redisClient.expire("reports_" + summaryId, 60),
+      redisClient.expire(summaryId, 60),
+    ]);
   }
 
   private async initSummary() {
