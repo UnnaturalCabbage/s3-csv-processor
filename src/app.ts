@@ -5,12 +5,13 @@ import cors from "cors";
 
 import * as middlewares from "./middlewares";
 import router from "./routes";
+import { logger } from "./setup";
 
 require("dotenv").config();
 
 const app = express();
 
-// app.use(morgan("dev"));
+app.use(morgan("dev"));
 app.use(helmet());
 app.use(cors());
 app.use(express.json());
@@ -24,5 +25,5 @@ app.use(middlewares.errorHandler);
 
 export default (port: number) =>
   app.listen(port, () => {
-    console.log(`Listening: http://localhost:${port}`);
+    logger.log(`Listening: http://localhost:${port}`);
   });
